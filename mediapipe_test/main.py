@@ -8,14 +8,14 @@ from mediapipe.tasks.python import vision
 
 
 CAMERA_INDEX = 0
-MODEL_PATH = Path("models/face_landmarker.task")
+
+FACE_MODEL_PATH = Path("models/face_landmarker.task")
+HAND_MODEL_PATH = Path("models/hand_landmarker.task")
 
 
 def create_face_landmarker(model_path: Path):
-    base_options = python.BaseOptions(model_asset_path=str(model_path))
-
     options = vision.FaceLandmarkerOptions(
-        base_options=base_options,
+        base_options=python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
         num_faces=1,
         output_face_blendshapes=True,
@@ -28,32 +28,44 @@ def create_face_landmarker(model_path: Path):
     return vision.FaceLandmarker.create_from_options(options)
 
 
+def create_hand_landmarker(model_path: Path):
+    options = vision.HandLandmarkerOptions(
+        base_options=python.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+    return vision.HandLandmarker.create_from_options(options)
+
+
 def frame_to_mp_image(frame_bgr):
     frame_rgb = cv.cvtColor(frame_bgr, cv.COLOR_BGR2RGB)
     return mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
 
-def draw_face_landmarks(frame, result):
-    if not result.face_landmarks:
+def draw_normalized_landmarks(frame, landmarks_list, color=(0, 255, 0), radius=1):
+    if not landmarks_list:
         return
 
     height, width, _ = frame.shape
 
-    for face_landmarks in result.face_landmarks:
-        for landmark in face_landmarks:
-            # since landmarks info is normalized, we need to multiply by width and height to get the real coordinates
+    for landmarks in landmarks_list:
+        for landmark in landmarks:
             x = int(landmark.x * width)
             y = int(landmark.y * height)
 
             if 0 <= x < width and 0 <= y < height:
-                cv.circle(frame, (x, y), 1, (0, 255, 0), -1)
+                cv.circle(frame, (x, y), radius, color, -1)
 
 
-def draw_blendshapes(frame, result):
-    if not result.face_blendshapes:
+def draw_blendshapes(frame, face_result):
+    if not face_result.face_blendshapes:
         return
 
-    blendshapes = result.face_blendshapes[0]
+    blendshapes = face_result.face_blendshapes[0]
     top_blendshapes = sorted(
         blendshapes,
         key=lambda category: category.score,
@@ -76,23 +88,42 @@ def draw_blendshapes(frame, result):
         y += 24
 
 
-def draw_debug_info(frame, result, fps: float):
-    face_count = len(result.face_landmarks) if result.face_landmarks else 0
+def draw_hands_info(frame, hand_result):
+    if not hand_result.handedness:
+        return
+
+    y = frame.shape[0] - 60
+
+    for i, handedness in enumerate(hand_result.handedness):
+        if not handedness:
+            continue
+
+        category = handedness[0]
+        text = f"hand {i}: {category.category_name} {category.score:.2f}"
+
+        cv.putText(
+            frame,
+            text,
+            (20, y),
+            cv.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+        )
+
+        y += 24
+
+
+def draw_debug_info(frame, face_result, hand_result, fps: float):
+    face_count = len(face_result.face_landmarks) if face_result.face_landmarks else 0
+    hand_count = len(hand_result.hand_landmarks) if hand_result.hand_landmarks else 0
+
+    text = f"FPS: {fps:.1f} | faces: {face_count} | hands: {hand_count}"
 
     cv.putText(
         frame,
-        f"FPS: {fps:.1f}",
+        text,
         (20, 30),
-        cv.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        1,
-    )
-
-    cv.putText(
-        frame,
-        f"faces: {face_count}",
-        (20, frame.shape[0] - 20),
         cv.FONT_HERSHEY_SIMPLEX,
         0.7,
         (255, 255, 255),
@@ -101,11 +132,11 @@ def draw_debug_info(frame, result, fps: float):
 
 
 def camera_loop(camera_index: int):
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Model not found: {MODEL_PATH}\n"
-            "Download face_landmarker.task into the models/ directory."
-        )
+    if not FACE_MODEL_PATH.exists():
+        raise FileNotFoundError(f"Missing model: {FACE_MODEL_PATH}")
+
+    if not HAND_MODEL_PATH.exists():
+        raise FileNotFoundError(f"Missing model: {HAND_MODEL_PATH}")
 
     cap = cv.VideoCapture(camera_index)
 
@@ -117,7 +148,10 @@ def camera_loop(camera_index: int):
     fps = 0.0
 
     try:
-        with create_face_landmarker(MODEL_PATH) as landmarker:
+        with (
+            create_face_landmarker(FACE_MODEL_PATH) as face_landmarker,
+            create_hand_landmarker(HAND_MODEL_PATH) as hand_landmarker,
+        ):
             while True:
                 ret, frame = cap.read()
 
@@ -132,19 +166,37 @@ def camera_loop(camera_index: int):
                     fps = 1.0 / delta
 
                 timestamp_ms = int((now - start_time) * 1000)
-
                 mp_image = frame_to_mp_image(frame)
 
-                result = landmarker.detect_for_video(
+                face_result = face_landmarker.detect_for_video(
                     mp_image,
                     timestamp_ms,
                 )
 
-                draw_face_landmarks(frame, result)
-                draw_blendshapes(frame, result)
-                draw_debug_info(frame, result, fps)
+                hand_result = hand_landmarker.detect_for_video(
+                    mp_image,
+                    timestamp_ms,
+                )
 
-                cv.imshow("mediapipe face debugger", frame)
+                draw_normalized_landmarks(
+                    frame,
+                    face_result.face_landmarks,
+                    color=(0, 255, 0),
+                    radius=1,
+                )
+
+                draw_normalized_landmarks(
+                    frame,
+                    hand_result.hand_landmarks,
+                    color=(255, 0, 0),
+                    radius=2,
+                )
+
+                draw_blendshapes(frame, face_result)
+                draw_hands_info(frame, hand_result)
+                draw_debug_info(frame, face_result, hand_result, fps)
+
+                cv.imshow("mediapipe debugger", frame)
 
                 if cv.waitKey(1) & 0xFF == ord("q"):
                     break
