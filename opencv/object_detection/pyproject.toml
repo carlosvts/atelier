@@ -1,14 +1,9 @@
 [project]
-name = "opencv"
+name = "object-detection"
 version = "0.1.0"
-description = "Fundamentals on opencv"
+description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "opencv-python<5",
-]
-
-[tool.uv.workspace]
-members = [
-    "object_detection",
 ]
