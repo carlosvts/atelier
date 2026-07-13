@@ -563,6 +563,44 @@ def draw_debug_info(frame, fps: float, hand_count: int):
         1,
     )
 
+def get_hand_label(hand_result, hand_index: int) -> str:
+    """
+    Retorna uma identificação para a mão detectada.
+
+    Esperado conceitualmente:
+        hand_result.handedness[i] -> categorias da mão i
+
+    Em algumas versões, a estrutura pode vir como:
+        handedness[i][0] -> Category
+
+    Em outras, pode vir com um nível extra:
+        handedness[i][0][0] -> Category
+
+    Por isso esta função desce a estrutura até encontrar
+    um objeto que tenha category_name.
+    """
+
+    fallback = f"hand_{hand_index}"
+
+    if not hand_result.handedness:
+        return fallback
+
+    if hand_index >= len(hand_result.handedness):
+        return fallback
+
+    item = hand_result.handedness[hand_index]
+
+    # Desce listas aninhadas até chegar no objeto Category.
+    while isinstance(item, list):
+        if not item:
+            return fallback
+        item = item[0]
+
+    if hasattr(item, "category_name"):
+        return item.category_name
+
+    return fallback
+
 
 def camera_loop(camera_index: int):
     if not MODEL_PATH.exists():
@@ -576,7 +614,8 @@ def camera_loop(camera_index: int):
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {camera_index}")
 
-    rectangle_drawer = RectangleDrawer()
+    # já que vamos usar duas maos, criamos um dicionario 
+    rectangle_drawers: dict[str, RectangleDrawer] = {}
 
     start_time = time.monotonic()
     previous_time = time.monotonic()
@@ -616,42 +655,73 @@ def camera_loop(camera_index: int):
                     else 0
                 )
 
-                # Por enquanto, vamos usar só a primeira mão detectada
-                # para controlar o retângulo.
-                if hand_result.hand_landmarks:
-                    first_hand_landmarks = hand_result.hand_landmarks[0]
+                # Usando duas mãos para criar retangulos
+                seen_hands: set[str] = set()
 
+                if hand_result.hand_landmarks:
                     height, width, _ = frame.shape
 
-                    pinch_info = compute_pinch_info(
-                        first_hand_landmarks,
-                        width,
-                        height,
-                    )
+                    # Agora processamos todas as mãos detectadas,
+                    # não apenas hand_result.hand_landmarks[0] (uma mao só).
+                    for hand_index, hand_landmarks in enumerate(hand_result.hand_landmarks):
+                        hand_label = get_hand_label(hand_result, hand_index)
+                        seen_hands.add(hand_label)
 
-                    # Atualiza a máquina de estado do retângulo.
-                    rectangle_drawer.update(pinch_info)
+                        # Se essa mão ainda não tem um RectangleDrawer próprio,
+                        # criamos um agora.
+                        if hand_label not in rectangle_drawers:
+                            rectangle_drawers[hand_label] = RectangleDrawer()
 
-                    # Desenha a mão e a pinça.
-                    draw_hand_landmarks(frame, first_hand_landmarks)
-                    draw_pinch_debug(
-                        frame,
-                        pinch_info,
-                        rectangle_drawer.is_pinching,
-                    )
+                        # Pegamos o drawer específico dessa mão.
+                        rectangle_drawer = rectangle_drawers[hand_label]
+
+                        pinch_info = compute_pinch_info(
+                            hand_landmarks,
+                            width,
+                            height,
+                        )
+
+                        # Atualiza o estado só dessa mão.
+                        rectangle_drawer.update(pinch_info)
+
+                        draw_hand_landmarks(frame, hand_landmarks)
+                        draw_pinch_debug(
+                            frame,
+                            pinch_info,
+                            rectangle_drawer.is_pinching,
+                        )
+
+                        cv.putText(
+                            frame,
+                            hand_label,
+                            (pinch_info.center[0] + 12, pinch_info.center[1] + 12),
+                            cv.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (255, 255, 255),
+                            2,
+                        )
+
+                    # Se uma mão sumiu neste frame, cancela o gesto dela.
+                    for hand_label, rectangle_drawer in rectangle_drawers.items():
+                        if hand_label not in seen_hands:
+                            rectangle_drawer.cancel_current_gesture()
 
                 else:
-                    # Se a mão sumiu, cancelamos o gesto atual para evitar
-                    # finalizar retângulo sem querer.
-                    rectangle_drawer.cancel_current_gesture()
+                    # Se nenhuma mão apareceu, cancela gestos de todas.
+                    for rectangle_drawer in rectangle_drawers.values():
+                        rectangle_drawer.cancel_current_gesture()
 
-                # Desenha retângulos depois da lógica da mão.
-                rectangle_drawer.draw(frame)
+                # Desenha os retângulos de todas as mãos.
+                for rectangle_drawer in rectangle_drawers.values():
+                    rectangle_drawer.draw(frame) 
 
-                draw_handedness(frame, hand_result)
-                draw_debug_info(frame, fps, hand_count)
+                    # Desenha retângulos depois da lógica da mão.
+                    rectangle_drawer.draw(frame)
 
-                cv.imshow("pinch rectangle drawer", frame)
+                    draw_handedness(frame, hand_result)
+                    draw_debug_info(frame, fps, hand_count)
+
+                    cv.imshow("pinch rectangle drawer", frame)
 
                 key = cv.waitKey(1) & 0xFF
 
@@ -659,7 +729,8 @@ def camera_loop(camera_index: int):
                     break
 
                 if key == ord("c"):
-                    rectangle_drawer.clear()
+                    for rectangle_drawer in rectangle_drawers.values():
+                        rectangle_drawer.clear()    
 
     finally:
         cap.release()
